@@ -1035,10 +1035,18 @@ class MainActivity : AppCompatActivity() {
                     if (json.optBoolean("ok")) {
                         val bal = json.optDouble("balance", 0.0)
                         val accName = if (accountType == "live") "حقيقي" else "تجريبي"
-                        tvBalance.text = String.format(Locale.US, "\$%.2f", bal)
-                        tvPL.text = "الرصيد ($accName)"
-                        tvPL.setTextColor(cMuted)
-                        Toast.makeText(this@MainActivity, "✅ تم التفعيل", Toast.LENGTH_SHORT).show()
+                        if (!json.optBoolean("pending")) {
+                            tvBalance.text = String.format(Locale.US, "\$%.2f", bal)
+                            tvPL.text = "الرصيد ($accName)"
+                            tvPL.setTextColor(cMuted)
+                        }
+                        if (json.optBoolean("pending")) {
+                            tvBalance.text = "الرصيد: بانتظار الاتصال"
+                            tvPL.text = "⏳ Quotex يحظر الاتصال مؤقتاً، سيبدأ التداول تلقائياً عند فك الحظر"
+                            Toast.makeText(this@MainActivity, "✅ تم التفعيل — بانتظار فك حظر Quotex", Toast.LENGTH_LONG).show()
+                        } else {
+                            Toast.makeText(this@MainActivity, "✅ تم التفعيل", Toast.LENGTH_SHORT).show()
+                        }
                         uiPopulated = true
                         lastPowerKey = ""
                         fetchUserInfo()
