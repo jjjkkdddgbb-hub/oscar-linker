@@ -2,15 +2,23 @@ package com.oscar.linker
 
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
@@ -21,6 +29,8 @@ import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -30,7 +40,10 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.util.UUID
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
@@ -106,18 +119,52 @@ class MainActivity : AppCompatActivity() {
     private var lastServerLocked = false
     private var lastServerAccountType = "demo"
 
+    // وضع الراحة، الأحداث، الأصوات، الخلفية
+    private var restMode = false
+    private var lastEventId = -1L
+    private var eventsBusy = false
+    private var bgBusy = false
+    private var pendingOpenAsset: String? = null
+    private val recentEvents = ArrayList<JSONObject>()
+    private val sound by lazy { SoundFx() }
+    private lateinit var tvRest: TextView
+    private lateinit var eventsCard: LinearLayout
+    private lateinit var eventsList: LinearLayout
+    private lateinit var pairChip: TextView
+    private lateinit var bgImage: ImageView
+    private lateinit var candleView: CandleBackgroundView
+
     // اختيارات الواجهة
     private var accountLive = false
     private var modeFixed = false
     private var autoKind = true            // true = تداول آلي، false = نسخ صفقات المدير
-    private var selectedStrategy = "bot"
+    private var selectedStrategies: MutableSet<String> = mutableSetOf("bot")
     private var strategiesJson = ""
     private var strategyItems: List<JSONObject> = emptyList()
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(45, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .build()
+    // معرّف الجهاز: يُربط به المفتاح، فلا يعمل المفتاح نفسه على جهاز آخر
+    private val deviceId: String by lazy {
+        val sp = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
+        var id = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+        if (id.length < 8 || id == "9774d56d682e549c") {
+            id = sp.getString("fallback_device_id", null)
+                ?: UUID.randomUUID().toString().replace("-", "").also { sp.edit().putString("fallback_device_id", it).apply() }
+        }
+        "and-$id"
+    }
+
+    private val client by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(45, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .addInterceptor { chain ->
+                chain.proceed(chain.request().newBuilder().header("X-Device-Id", deviceId).build())
+            }
+            .build()
+    }
+
+    private fun reasonOf(body: String?, fallback: String): String =
+        try { JSONObject(body ?: "{}").optString("error", fallback).ifEmpty { fallback } } catch (e: Exception) { fallback }
 
     private val BASE_URL = "https://signal-bott.onrender.com"
     private val QX_DOMAIN = "https://quotex.com"
@@ -249,6 +296,9 @@ class MainActivity : AppCompatActivity() {
         window.statusBarColor = cBg
         window.navigationBarColor = cBg
         prefs = getSharedPreferences("oscar_prefs", Context.MODE_PRIVATE)
+        ensureNotificationChannel()
+        askNotificationPermission()
+        pendingOpenAsset = intent?.getStringExtra("open_asset")
         val saved = prefs.getString("license_key", null)
 
         if (saved.isNullOrBlank()) {
@@ -268,6 +318,12 @@ class MainActivity : AppCompatActivity() {
         val root = FrameLayout(this)
         root.addView(CandleBackgroundView(this), FrameLayout.LayoutParams(MATCH, MATCH))
         setContentView(root)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val a = intent.getStringExtra("open_asset")
+        if (!a.isNullOrEmpty() && ::webView.isInitialized) openMarketForAsset(a, "")
     }
 
     override fun onResume() {
@@ -396,7 +452,12 @@ class MainActivity : AppCompatActivity() {
     private fun setupUi() {
         val frame = FrameLayout(this)
         frame.layoutDirection = View.LAYOUT_DIRECTION_RTL
-        frame.addView(CandleBackgroundView(this), FrameLayout.LayoutParams(MATCH, MATCH))
+        frame.setBackgroundColor(cBg)
+        bgImage = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+        frame.addView(bgImage, FrameLayout.LayoutParams(MATCH, MATCH))
+        candleView = CandleBackgroundView(this)
+        frame.addView(candleView, FrameLayout.LayoutParams(MATCH, MATCH))
+        applyBackgroundFile()
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -432,6 +493,15 @@ class MainActivity : AppCompatActivity() {
         }
         container.addView(webView)
         container.addView(settingsView)
+        pairChip = text("", 13f, Color.BLACK, true, Gravity.CENTER).apply {
+            background = shape(cGold, 24)
+            setPadding(dp(16), dp(9), dp(16), dp(9))
+            visibility = View.GONE
+            setOnClickListener { visibility = View.GONE }
+        }
+        container.addView(pairChip, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+            topMargin = dp(10)
+        })
 
         // الشريط السفلي
         val bottomBar = LinearLayout(this).apply {
@@ -551,6 +621,13 @@ class MainActivity : AppCompatActivity() {
 
         // 1) الحساب والرصيد
         val accountCard = card()
+        tvRest = text("🛠️ السيرفر في وضع الراحة مؤقتاً — لا يمكن التشغيل الآن", 13f, Color.BLACK, true, Gravity.CENTER).apply {
+            background = shape(cGold, 16)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            visibility = View.GONE
+            layoutParams = lp(MATCH, WRAP, 0, 0, 0, 12)
+        }
+        accountCard.addView(tvRest)
         tvLinkStatus = text("⏳ جاري التحميل...", 16f, cText, true, Gravity.CENTER)
         accountCard.addView(tvLinkStatus)
         tvBalance = text("الرصيد: —", 26f, cGold, true, Gravity.CENTER).apply { setPadding(0, dp(10), 0, dp(2)) }
@@ -587,7 +664,7 @@ class MainActivity : AppCompatActivity() {
         // 3) بانر الاستراتيجيات
         strategyCard = card()
         strategyCard.addView(text("🎯 الاستراتيجيات", 17f, cGold, true))
-        strategyCard.addView(text("اختر استراتيجيتك — اختيارك لك وحدك ولا يؤثر على غيرك", 12f, cMuted).apply {
+        strategyCard.addView(text("يمكنك اختيار أكثر من استراتيجية معاً — اختيارك لك وحدك ولا يؤثر على غيرك", 12f, cMuted).apply {
             setPadding(0, dp(2), 0, dp(10))
         })
         val hs = HorizontalScrollView(this).apply {
@@ -683,6 +760,20 @@ class MainActivity : AppCompatActivity() {
         powerBox.addView(tvPowerNote)
         layout.addView(powerBox)
 
+        // 5.5) آخر الصفقات (اضغط لفتح الزوج في السوق)
+        eventsCard = card().apply { visibility = View.GONE }
+        eventsCard.addView(text("🕒 آخر العمليات", 17f, cGold, true))
+        eventsCard.addView(text("اضغط على أي صفقة لفتح زوجها في السوق", 12f, cMuted).apply { setPadding(0, dp(2), 0, dp(10)) })
+        eventsList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        eventsCard.addView(eventsList)
+        layout.addView(eventsCard)
+
+        val btnNotif = roundButton("🔔 إعدادات الإشعارات والأصوات", cChip, cText, 14f).apply {
+            layoutParams = lp(MATCH, WRAP, 40, 6, 40, 0)
+            setOnClickListener { showNotificationSettings() }
+        }
+        layout.addView(btnNotif)
+
         // 6) فصل الحساب
         btnUnlink = roundButton("🔌 فصل الحساب", Color.parseColor("#2a1d24"), Color.parseColor("#ef9a9a"), 14f).apply {
             visibility = View.GONE
@@ -740,8 +831,8 @@ class MainActivity : AppCompatActivity() {
     private fun refreshPower(force: Boolean = false) {
         if (!::powerButton.isInitialized) return
         val running = isLocked
-        val canStart = isLinked && !(autoKind && !adminAutoEnabled)
-        val key = "$running|$canStart|$autoKind|$isAutoTrading|$isLinked|$adminAutoEnabled"
+        val canStart = isLinked && !restMode && !(autoKind && !adminAutoEnabled)
+        val key = "$running|$canStart|$autoKind|$isAutoTrading|$isLinked|$adminAutoEnabled|$restMode"
         if (!force && key == lastPowerKey) return
         lastPowerKey = key
         pulse?.cancel()
@@ -771,6 +862,7 @@ class MainActivity : AppCompatActivity() {
                 tvPowerLabel.setTextColor(cMuted)
                 tvPowerLabel.text = "تشغيل"
                 tvPowerNote.text = when {
+                    restMode -> "🛠️ السيرفر في وضع الراحة مؤقتاً، حاول لاحقاً"
                     !isLinked -> "اربط حساب Quotex أولاً"
                     else -> "🚫 التداول الآلي متوقف من المدير حالياً"
                 }
@@ -797,14 +889,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderStrategies() {
         if (!::strategyRow.isInitialized) return
-        val sig = strategiesJson + "|" + selectedStrategy + "|" + isLocked
+        val sig = strategiesJson + "|" + selectedStrategies.sorted().joinToString(",") + "|" + isLocked
         if (sig == lastStrategySig) return
         lastStrategySig = sig
         strategyRow.removeAllViews()
         for (item in strategyItems) {
             val sid = item.optString("id")
             val isEn = item.optBoolean("enabled", true)
-            val isOn = sid == selectedStrategy
+            val isOn = selectedStrategies.contains(sid)
 
             val c = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -818,11 +910,16 @@ class MainActivity : AppCompatActivity() {
                 pressable(this)
                 setOnClickListener {
                     if (isLocked) {
-                        Toast.makeText(this@MainActivity, "أوقف التشغيل أولاً ثم غيّر الاستراتيجية", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this@MainActivity, "أوقف التشغيل أولاً ثم غيّر الاستراتيجيات", Toast.LENGTH_SHORT).show()
                     } else if (!isEn) {
                         Toast.makeText(this@MainActivity, "هذه الاستراتيجية معطّلة من المدير حالياً", Toast.LENGTH_SHORT).show()
                     } else {
-                        selectedStrategy = sid
+                        if (selectedStrategies.contains(sid)) {
+                            if (selectedStrategies.size > 1) selectedStrategies.remove(sid)
+                            else Toast.makeText(this@MainActivity, "يجب اختيار استراتيجية واحدة على الأقل", Toast.LENGTH_SHORT).show()
+                        } else {
+                            selectedStrategies.add(sid)
+                        }
                         renderStrategies()
                     }
                 }
@@ -837,10 +934,16 @@ class MainActivity : AppCompatActivity() {
             })
             c.addView(text(if (isEn) item.optString("tagline") else "معطّلة من المدير", 11f,
                 if (isEn) cMuted else cRed, false, Gravity.CENTER))
+            c.addView(text(if (isOn) "✔ مختارة" else "اضغط للاختيار", 11f,
+                if (isOn) cGreen else cMuted, true, Gravity.CENTER).apply { setPadding(0, dp(6), 0, 0) })
             strategyRow.addView(c)
         }
-        val cur = strategyItems.firstOrNull { it.optString("id") == selectedStrategy }
-        tvStrategyDesc.text = cur?.optString("desc") ?: ""
+        val chosen = strategyItems.filter { selectedStrategies.contains(it.optString("id")) }
+        tvStrategyDesc.text = when {
+            chosen.isEmpty() -> ""
+            chosen.size == 1 -> chosen[0].optString("desc")
+            else -> "تعمل معاً: " + chosen.joinToString(" + ") { it.optString("name") }
+        }
     }
 
     private fun onPowerPressed() {
@@ -850,8 +953,16 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "اربط حساب Quotex أولاً", Toast.LENGTH_SHORT).show()
             return
         }
+        if (restMode) {
+            Toast.makeText(this, "السيرفر في وضع الراحة مؤقتاً، حاول لاحقاً", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (autoKind && !adminAutoEnabled) {
             Toast.makeText(this, "التداول الآلي متوقف من المدير حالياً", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (autoKind && selectedStrategies.isEmpty()) {
+            Toast.makeText(this, "اختر استراتيجية واحدة على الأقل", Toast.LENGTH_SHORT).show()
             return
         }
         saveAndEnable(if (autoKind) "auto" else "copy")
@@ -862,8 +973,10 @@ class MainActivity : AppCompatActivity() {
         webView.visibility = View.GONE
         settingsView.visibility = View.VISIBLE
         tvScreen.text = "📊 الإعدادات"
+        if (::pairChip.isInitialized) pairChip.visibility = View.GONE
         updateTabButtons()
         fetchUserInfo()
+        pendingOpenAsset?.let { a -> pendingOpenAsset = null; openMarketForAsset(a, "") }
     }
 
     private fun showMarket() {
@@ -894,7 +1007,8 @@ class MainActivity : AppCompatActivity() {
                 val res = client.newCall(req).execute()
 
                 if (res.code == 403 || res.code == 401) {
-                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح أو حذفه") }
+                    val why = reasonOf(res.body?.string(), "تم إيقاف المفتاح أو حذفه")
+                    withContext(Dispatchers.Main) { kickUserOut(why) }
                     return@launch
                 }
 
@@ -912,6 +1026,11 @@ class MainActivity : AppCompatActivity() {
                     isAutoTrading = json.optBoolean("is_auto_trading")
                     val serverAccountType = json.optString("account_type", "demo")
                     val serverStrategy = json.optString("strategy", "bot")
+                    restMode = json.optBoolean("rest_mode", false)
+                    val serverSelected = LinkedHashSet<String>()
+                    val selArr = json.optJSONArray("selected_strategies")
+                    if (selArr != null) for (i in 0 until selArr.length()) serverSelected.add(selArr.getString(i))
+                    if (serverSelected.isEmpty()) serverSelected.add(serverStrategy)
                     isLocked = newLocked
 
                     // قائمة الاستراتيجيات (نعيد الرسم فقط عند التغيير)
@@ -951,18 +1070,26 @@ class MainActivity : AppCompatActivity() {
                         etTradeValue.setText(fmt(json.optDouble("trade_value", 1.0)))
                         etStopLoss.setText(fmt(json.optDouble("max_loss_value", 0.0)))
                         etStopProfit.setText(fmt(json.optDouble("max_profit_value", 0.0)))
-                        selectedStrategy = serverStrategy
+                        selectedStrategies = serverSelected.toMutableSet()
                         uiPopulated = true
                     }
                     if (isLocked) {
                         // أثناء التشغيل نعرض ما هو مُفعّل فعلاً على الخادم
                         autoKind = isAutoTrading || !isCopying
-                        selectedStrategy = serverStrategy
+                        selectedStrategies = serverSelected.toMutableSet()
                         accountLive = serverAccountType == "live"
                     }
                     lastServerLocked = newLocked
 
+                    tvRest.visibility = if (restMode) View.VISIBLE else View.GONE
                     refreshAll()
+
+                    if (lastEventId < 0) {
+                        val savedId = prefs.getLong("last_event_id_" + licenseKey, -1L)
+                        lastEventId = if (savedId >= 0) savedId else json.optLong("last_event_id", 0L)
+                        prefs.edit().putLong("last_event_id_" + licenseKey, lastEventId).apply()
+                    }
+                    syncBackground(json.optString("background_version", "0"))
 
                     // أثناء التشغيل نحدّث الرصيد كل 15 ثانية تقريباً
                     if (isLinked && isLocked && uiPopulated && nowMs() - lastStatsAt > 15000) {
@@ -1016,7 +1143,9 @@ class MainActivity : AppCompatActivity() {
             put("max_loss_value", etStopLoss.text.toString().toDoubleOrNull() ?: 0.0)
             put("max_profit_value", etStopProfit.text.toString().toDoubleOrNull() ?: 0.0)
             put("enable_type", type)
-            put("strategy", if (type == "auto") selectedStrategy else "bot")
+            val chosen = if (type == "auto") selectedStrategies.toList() else listOf("bot")
+            put("strategies", JSONArray(chosen))
+            put("strategy", chosen.firstOrNull() ?: "bot")
         }
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -1026,7 +1155,8 @@ class MainActivity : AppCompatActivity() {
                     .build()
                 val res = client.newCall(req).execute()
                 if (res.code == 403) {
-                    withContext(Dispatchers.Main) { busy = false; kickUserOut("تم إيقاف المفتاح") }
+                    val why = reasonOf(res.body?.string(), "تم إيقاف المفتاح")
+                    withContext(Dispatchers.Main) { busy = false; kickUserOut(why) }
                     return@launch
                 }
                 val json = JSONObject(res.body?.string() ?: "{}")
@@ -1129,6 +1259,7 @@ class MainActivity : AppCompatActivity() {
                 if (::licenseKey.isInitialized) {
                     // user_info كل 5 ثوانٍ: حتى ينطفئ الزر بسرعة عندما يوقف المدير التداول
                     fetchUserInfo()
+                    fetchEvents()
                     // الرصيد كل دقيقة تقريباً على شاشة الإعدادات عند عدم التشغيل
                     if (currentTab == "settings" && isLinked && !isLocked && tickCount % 12 == 0) {
                         fetchStatsForAccount(if (accountLive) "live" else "demo")
@@ -1149,7 +1280,8 @@ class MainActivity : AppCompatActivity() {
                 val res = client.newCall(req).execute()
 
                 if (res.code == 401 || res.code == 403) {
-                    withContext(Dispatchers.Main) { kickUserOut("تم إيقاف المفتاح") }
+                    val why = reasonOf(res.body?.string(), "تم إيقاف المفتاح")
+                    withContext(Dispatchers.Main) { kickUserOut(why) }
                     return@launch
                 }
 
@@ -1188,6 +1320,287 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     tvPL.text = "تعذر الاتصال"
                 }
+            }
+        }
+    }
+
+    // ───────── الإشعارات والأصوات والأحداث ─────────
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val ch = NotificationChannel("trades", "الصفقات", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                description = "إشعارات تنفيذ الصفقات ونهاية الجلسة"
+                setSound(null, null)   // الصوت يُشغَّل من التطبيق نفسه
+            }
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+        }
+    }
+
+    private fun askNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 77)
+        }
+    }
+
+    private fun postNotification(title: String, text: String, asset: String?) {
+        if (!prefs.getBoolean("notif_enabled", true)) return
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) return
+        try {
+            val intent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                if (asset != null) putExtra("open_asset", asset)
+            }
+            val pi = PendingIntent.getActivity(
+                this, (System.currentTimeMillis() % 100000).toInt(), intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val n = NotificationCompat.Builder(this, "trades")
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .build()
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .notify((System.currentTimeMillis() % 1000000).toInt(), n)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun prettyAsset(raw: String): String {
+        val otc = raw.endsWith("_otc", ignoreCase = true)
+        val base = raw.replace("_otc", "", ignoreCase = true)
+        val name = if (base.length == 6 && base.all { it.isLetter() }) base.substring(0, 3) + "/" + base.substring(3) else base
+        return if (otc) name + " (OTC)" else name
+    }
+
+    private fun dirAr(d: String): String = when (d.lowercase()) {
+        "call" -> "صعود ⬆️"
+        "put" -> "هبوط ⬇️"
+        else -> ""
+    }
+
+    private fun fetchEvents() {
+        if (!::licenseKey.isInitialized || lastEventId < 0 || eventsBusy) return
+        eventsBusy = true
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder().url("$BASE_URL/api/app/events/$licenseKey?after=$lastEventId").build()
+                val res = client.newCall(req).execute()
+                val body = res.body?.string() ?: "{}"
+                if (res.isSuccessful) {
+                    val arr = JSONObject(body).optJSONArray("events")
+                    val list = ArrayList<JSONObject>()
+                    if (arr != null) for (i in 0 until arr.length()) list.add(arr.getJSONObject(i))
+                    if (list.isNotEmpty()) withContext(Dispatchers.Main) { handleEvents(list) }
+                }
+            } catch (e: Exception) {
+            } finally {
+                eventsBusy = false
+            }
+        }
+    }
+
+    private fun handleEvents(list: List<JSONObject>) {
+        var openPlayed = false
+        for (ev in list) {
+            val id = ev.optLong("id")
+            if (id <= lastEventId) continue
+            lastEventId = id
+            recentEvents.add(0, ev)
+            val asset = ev.optString("asset")
+            when (ev.optString("kind")) {
+                "trade_open" -> {
+                    if (!openPlayed && prefs.getBoolean("snd_open", true)) { sound.cash(); openPlayed = true }
+                    postNotification(
+                        "تم تنفيذ صفقة",
+                        "على " + prettyAsset(asset) + " (" + dirAr(ev.optString("direction")) + ") — " + ev.optString("strategy_name"),
+                        asset
+                    )
+                }
+                "session_win" -> {
+                    if (prefs.getBoolean("snd_win", true)) sound.win()
+                    postNotification("🎉 انتهت الجلسة بربح", "تم الوصول إلى حد الربح الذي حددته.", null)
+                }
+                "session_loss" -> {
+                    if (prefs.getBoolean("snd_loss", true)) sound.loss()
+                    postNotification("⚠️ انتهت الجلسة بخسارة", "تم الوصول إلى حد الخسارة الذي حددته.", null)
+                }
+            }
+        }
+        while (recentEvents.size > 12) recentEvents.removeAt(recentEvents.size - 1)
+        prefs.edit().putLong("last_event_id_" + licenseKey, lastEventId).apply()
+        renderEvents()
+    }
+
+    private fun renderEvents() {
+        if (!::eventsList.isInitialized) return
+        eventsList.removeAllViews()
+        eventsCard.visibility = if (recentEvents.isEmpty()) View.GONE else View.VISIBLE
+        for (ev in recentEvents) {
+            val kind = ev.optString("kind")
+            val asset = ev.optString("asset")
+            val dir = ev.optString("direction")
+            val line1: String
+            val line2: String
+            when (kind) {
+                "trade_open" -> {
+                    line1 = "تم تنفيذ صفقة على " + prettyAsset(asset) + " " + dirAr(dir)
+                    line2 = "باستراتيجية: " + ev.optString("strategy_name") + " • مبلغ " + fmt(ev.optDouble("amount", 0.0)) + "\$ • اضغط للفتح في السوق"
+                }
+                "session_win" -> { line1 = "🎉 انتهت الجلسة بربح"; line2 = "وصلت لحد الربح" }
+                else -> { line1 = "⚠️ انتهت الجلسة بخسارة"; line2 = "وصلت لحد الخسارة" }
+            }
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = shape(Color.parseColor("#0d1424"), 18, cCardStroke)
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                layoutParams = lp(MATCH, WRAP, 0, 0, 0, 8)
+                if (kind == "trade_open") {
+                    isClickable = true
+                    pressable(this)
+                    setOnClickListener { openMarketForAsset(asset, dir) }
+                }
+            }
+            row.addView(text(line1, 14f, cText, true))
+            row.addView(text(line2, 11f, cMuted))
+            eventsList.addView(row)
+        }
+    }
+
+    private val SELECT_ASSET_JS = """
+(function(raw){
+  try {
+    var want = String(raw).replace(/_otc${'$'}/i,'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    var isOtc = /_otc${'$'}/i.test(raw);
+    function norm(t){ return String(t||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+    function vis(e){ var r=e.getBoundingClientRect(); return r.width>0 && r.height>0; }
+    function clk(e){ try{ e.scrollIntoView({block:'center'}); }catch(x){} e.click(); }
+    var opener = document.querySelector('[class*="asset-select"],[class*="current-asset"],[class*="assets-select"]');
+    if (opener && vis(opener)) clk(opener);
+    setTimeout(function(){
+      var inp = document.querySelector('input[type="search"],input[class*="search"],input[placeholder*="earch"]');
+      if (inp) { inp.focus(); inp.value = want; inp.dispatchEvent(new Event('input',{bubbles:true})); }
+      setTimeout(function(){
+        var nodes = document.querySelectorAll('li,div,span,button,a');
+        for (var i=0;i<nodes.length;i++){
+          var e=nodes[i], t=norm(e.innerText);
+          if (t.indexOf(want)===0 && t.length < want.length+14 && vis(e)) {
+            if (isOtc && t.indexOf('OTC')<0) continue;
+            if (!isOtc && t.indexOf('OTC')>=0) continue;
+            clk(e); break;
+          }
+        }
+      },700);
+    },600);
+  } catch(e) {}
+})(__ASSET__);
+""".trimIndent()
+
+    private fun openMarketForAsset(asset: String, dir: String) {
+        showMarket()
+        pairChip.text = "📌 الزوج: " + prettyAsset(asset) + (if (dir.isNotEmpty()) " · " + dirAr(dir) else "") + "   ✕"
+        pairChip.visibility = View.VISIBLE
+        val js = SELECT_ASSET_JS.replace("__ASSET__", JSONObject.quote(asset))
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (currentTab == "market") webView.evaluateJavascript(js, null)
+        }, 2200)
+    }
+
+    private fun showNotificationSettings() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(10), dp(20), dp(4))
+        }
+        fun row(label: String, key: String) {
+            val r = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(8), 0, dp(8))
+            }
+            r.addView(TextView(this).apply {
+                text = label
+                textSize = 15f
+                layoutParams = LinearLayout.LayoutParams(0, WRAP, 1f)
+            })
+            r.addView(Switch(this).apply {
+                isChecked = prefs.getBoolean(key, true)
+                setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(key, c).apply() }
+            })
+            box.addView(r)
+        }
+        row("إظهار الإشعارات", "notif_enabled")
+        row("🔊 صوت المال عند تنفيذ صفقة", "snd_open")
+        row("🔔 رنين المال عند الانتهاء بربح", "snd_win")
+        row("😢 صوت حزين عند الانتهاء بخسارة", "snd_loss")
+        val tests = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        fun test(label: String, play: () -> Unit) {
+            tests.addView(roundButton(label, cChip, cText, 12f).apply {
+                layoutParams = lp(0, WRAP, 3, 0, 3, 0).also { it.weight = 1f }
+                setPadding(dp(6), dp(10), dp(6), dp(10))
+                setOnClickListener { play() }
+            })
+        }
+        test("تجربة: صفقة") { sound.cash() }
+        test("تجربة: ربح") { sound.win() }
+        test("تجربة: خسارة") { sound.loss() }
+        box.addView(tests)
+        AlertDialog.Builder(this)
+            .setTitle("🔔 إعدادات الإشعارات والأصوات")
+            .setView(box)
+            .setPositiveButton("تم", null)
+            .show()
+    }
+
+    // ───────── خلفية من المدير ─────────
+    private fun bgFile() = File(filesDir, "oscar_bg.img")
+
+    private fun applyBackgroundFile() {
+        try {
+            val f = bgFile()
+            if (!f.exists() || !::bgImage.isInitialized) return
+            val bmp = BitmapFactory.decodeFile(f.path) ?: return
+            bgImage.setImageBitmap(bmp)
+            if (::candleView.isInitialized) candleView.setImageMode(true)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun syncBackground(version: String) {
+        if (!::bgImage.isInitialized) return
+        if (version.isEmpty() || version == "0") {
+            if (bgFile().exists()) {
+                bgFile().delete()
+                prefs.edit().remove("bg_version").apply()
+                bgImage.setImageDrawable(null)
+                candleView.setImageMode(false)
+            }
+            return
+        }
+        if (version == prefs.getString("bg_version", "") || bgBusy) return
+        bgBusy = true
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val req = Request.Builder().url("$BASE_URL/api/app/background/$licenseKey").build()
+                val res = client.newCall(req).execute()
+                if (res.isSuccessful) {
+                    val bytes = res.body?.bytes()
+                    if (bytes != null && bytes.size > 100) {
+                        bgFile().writeBytes(bytes)
+                        prefs.edit().putString("bg_version", version).apply()
+                        withContext(Dispatchers.Main) { applyBackgroundFile() }
+                    }
+                }
+            } catch (e: Exception) {
+            } finally {
+                bgBusy = false
             }
         }
     }

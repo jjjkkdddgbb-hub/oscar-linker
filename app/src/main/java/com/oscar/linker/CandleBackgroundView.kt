@@ -73,14 +73,28 @@ class CandleBackgroundView(context: Context) : View(context) {
 
     private var scrimShader: LinearGradient? = null
 
+    private var imageMode = false
+
+    /** عند وجود صورة خلفية من المدير نخفّف الطبقة المعتمة حتى تظهر الصورة. */
+    fun setImageMode(on: Boolean) {
+        imageMode = on
+        buildScrim(height)
+        invalidate()
+    }
+
+    private fun buildScrim(h: Int) {
+        if (h <= 0) return
+        val cols = if (imageMode)
+            intArrayOf(Color.parseColor("#9E070b14"), Color.parseColor("#66070b14"), Color.parseColor("#B8070b14"))
+        else
+            intArrayOf(Color.parseColor("#E6070b14"), Color.parseColor("#99070b14"), Color.parseColor("#F2070b14"))
+        scrimShader = LinearGradient(0f, 0f, 0f, h.toFloat(), cols, floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP)
+        scrimPaint.shader = scrimShader
+    }
+
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        scrimShader = LinearGradient(
-            0f, 0f, 0f, h.toFloat(),
-            intArrayOf(Color.parseColor("#E6070b14"), Color.parseColor("#99070b14"), Color.parseColor("#F2070b14")),
-            floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
-        )
-        scrimPaint.shader = scrimShader
+        buildScrim(h)
         seed(w)
     }
 
